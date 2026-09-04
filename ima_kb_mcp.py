@@ -1,6 +1,6 @@
 """MCP server for Tencent IMA Knowledge Base (腾讯 ima 知识库).
 
-通过官方 IMA OpenAPI 提供知识库的搜索、浏览、读取能力。
+通过官方 IMA OpenAPI 提供知识库的搜索、浏览、读取、写入能力。
 认证方式：环境变量 IMA_OPENAPI_CLIENTID / IMA_OPENAPI_APIKEY，
 或写入 ~/.config/ima/client_id 与 ~/.config/ima/api_key。
 
@@ -19,7 +19,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 DEFAULT_BASE_URL = "https://ima.qq.com"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 
 class ImaClientError(Exception):
@@ -184,6 +184,160 @@ async def get_media_info(media_id: str) -> dict[str, Any]:
     if not media_id.strip():
         raise ImaClientError("media_id 不能为空。")
     return await _call_ima("openapi/wiki/v1/get_media_info", {"media_id": media_id})
+
+
+# ---------- 可写知识库 / 写入工具 ----------
+
+@mcp.tool()
+async def get_addable_knowledge_base_list(
+    cursor: str = "",
+    limit: int = 20,
+) -> dict[str, Any]:
+    """获取当前用户有权限添加内容的知识库列表。
+    当用户要添加内容但未指定目标知识库时使用。
+    - cursor: 分页游标，首页传空字符串
+    - limit: 每页数量，1-50
+    """
+    return await _call_ima(
+        "openapi/wiki/v1/get_addable_knowledge_base_list",
+        {"cursor": cursor, "limit": limit},
+    )
+
+
+@mcp.tool()
+async def check_repeated_names(
+    knowledge_base_id: str,
+    params: list[dict[str, Any]],
+    folder_id: str = "",
+) -> dict[str, Any]:
+    """上传文件到知识库前，检查目标位置是否已有同名文件。
+    仅用于文件类型（media_type 1/3/4/5/7/9/13/14/20/21），不用于网页、笔记。
+    - knowledge_base_id: 知识库 ID（必需）
+    - params: 待检查列表，每项 {"name": 文件名, "media_type": 类型}，如 [{"name":"a.pdf","media_type":1}]
+    - folder_id: 文件夹 ID，省略则检查根目录
+    """
+    if not knowledge_base_id.strip():
+        raise ImaClientError("knowledge_base_id 不能为空。")
+    if not params:
+        raise ImaClientError("params 不能为空，至少提供一项待检查文件。")
+    body: dict[str, Any] = {
+        "knowledge_base_id": knowledge_base_id,
+        "params": params,
+    }
+    folder_id = _opt_str({"folder_id": folder_id}, "folder_id")
+    if folder_id:
+        body["folder_id"] = folder_id
+    return await _call_ima("openapi/wiki/v1/check_repeated_names", body)
+
+
+@mcp.tool()
+async def create_media(
+    knowledge_base_id: str,
+    file_name: str,
+    file_size: int,
+    content_type: str,
+    file_ext: str,
+) -> dict[str, Any]:
+    """上传文件到知识库的第一步：创建媒体并获取 COS 上传凭证。
+    一般流程：create_media → 用 cos_credential 将文件上传到 COS → add_knowledge 入库。
+    - knowledge_base_id: 知识库 ID（必需）
+    - file_name: 文件名称（需含扩展名，最长 1024 字符）
+    - file_size: 文件大小（字节）
+    - content_type: MIME 类型，如 application/pdf
+    - file_ext: 文件后缀（无点号），如 pdf、docx
+    返回 media_id 与 cos_credential（含 secret_id/secret_key/token/bucket_name/region/cos_key）。
+    """
+    if not knowledge_base_id.strip():
+        raise ImaClientError("knowledge_base_id 不能为空。")
+    if not file_name.strip():
+        raise ImaClientError("file_name 不能为空。")
+    if file_size <= 0:
+        raise ImaClientError("file_size 必须大于 0。")
+    return await _call_ima(
+        "openapi/wiki/v1/create_media",
+        {
+            "knowledge_base_id": knowledge_base_id,
+            "file_name": file_name,
+            "file_size": file_size,
+            "content_type": content_type,
+            "file_ext": file_ext,
+        },
+    )
+
+
+@mcp.tool()
+async def add_knowledge(
+    knowledge_base_id: str,
+    media_type: int,
+    title: str,
+    media_id: str = "",
+    folder_id: str = "",
+    note_info: dict[str, Any] | None = None,
+    web_info: dict[str, Any] | None = None,
+    file_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """添加知识到知识库。三种典型用法：
+    1) 文件入库（文件上传后）：media_type=1/3/4...，media_id=create_media 的返回值，file_info 含 cos_key/file_size/file_name
+    2) 笔记入库：media_type=11，note_info={"content_id": 笔记ID}
+    3) 网页入库：media_type=2（普通网页）或 6（微信公众号），web_info={"content_id": URL}
+    一般建议：网页/公众号用 import_urls（自动识别、可批量）更省事。
+    - knowledge_base_id: 知识库 ID（必需）
+    - media_type: 媒体类型，见 MediaType 枚举（1 PDF, 3 Word, 4 PPT, 5 Excel, 9 图片, 11 笔记, 13 TXT...）
+    - title: 标题（文件入库时必须等于文件名）
+    - media_id: create_media 返回的媒体 ID（文件入库时必填）
+    - folder_id: 文件夹 ID，省略则添加到根目录
+    - note_info: 笔记信息 {"content_id": note_id}，media_type=11 时传
+    - web_info: 网页信息 {"content_id": url}，media_type=2/6 时传
+    - file_info: 文件信息 {"cos_key":..., "file_size":..., "file_name":...}，文件入库时传
+    """
+    if not knowledge_base_id.strip():
+        raise ImaClientError("knowledge_base_id 不能为空。")
+    if not title.strip():
+        raise ImaClientError("title 不能为空。")
+    body: dict[str, Any] = {
+        "knowledge_base_id": knowledge_base_id,
+        "media_type": media_type,
+        "title": title,
+    }
+    if media_id.strip():
+        body["media_id"] = media_id
+    folder_id = _opt_str({"folder_id": folder_id}, "folder_id")
+    if folder_id:
+        body["folder_id"] = folder_id
+    if note_info:
+        body["note_info"] = note_info
+    if web_info:
+        body["web_info"] = web_info
+    if file_info:
+        body["file_info"] = file_info
+    return await _call_ima("openapi/wiki/v1/add_knowledge", body)
+
+
+@mcp.tool()
+async def import_urls(
+    knowledge_base_id: str,
+    urls: list[str],
+    folder_id: str = "",
+) -> dict[str, Any]:
+    """批量导入网页 / 微信公众号文章到知识库。服务端自动识别 URL 类型。
+    支持普通网页、微信公众号文章（mp.weixin.qq.com/s）；不支持视频类（B站/YouTube）。
+    - knowledge_base_id: 知识库 ID（必需）
+    - urls: URL 列表（1-10 个）
+    - folder_id: 文件夹 ID，省略则添加到根目录
+    返回 results 映射：{"<url>": {url, ret_code, media_id}}。
+    """
+    if not knowledge_base_id.strip():
+        raise ImaClientError("knowledge_base_id 不能为空。")
+    if not urls:
+        raise ImaClientError("urls 不能为空，至少提供一个 URL。")
+    body: dict[str, Any] = {
+        "knowledge_base_id": knowledge_base_id,
+        "urls": urls,
+    }
+    folder_id = _opt_str({"folder_id": folder_id}, "folder_id")
+    if folder_id:
+        body["folder_id"] = folder_id
+    return await _call_ima("openapi/wiki/v1/import_urls", body)
 
 
 # ---------- 笔记 ----------

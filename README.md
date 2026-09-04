@@ -11,6 +11,11 @@
 | `list_knowledge` | 浏览知识库内容（含文件夹） |
 | `search_knowledge` | 在知识库内全文搜索（如"断路器 低电压脱扣"） |
 | `get_media_info` | 获取文件原文访问地址（PDF 等） |
+| `get_addable_knowledge_base_list` | 列出可添加（可写入）内容的知识库 |
+| `check_repeated_names` | 上传前检查目标位置是否同名 |
+| `create_media` | 创建媒体，获取 COS 上传凭证（上传第 1 步） |
+| `add_knowledge` | 添加知识入库（文件/笔记/网页） |
+| `import_urls` | 批量导入网页 / 公众号文章 |
 | `search_notes` | 搜索笔记 |
 | `get_note_content` | 读取笔记正文 |
 | `raw_call` | 直接调用任意 IMA OpenAPI 接口 |
